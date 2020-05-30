@@ -1,0 +1,237 @@
+#ссылка на мой репозиторий в git hub: https://github.com/angelica-t/HSE-Machine-Learning
+import pandas as pd
+import os
+import json
+import numpy as np
+from pandas.io.json import json_normalize
+
+
+#some_data=data.sample(frac=0.1, random_state=2)
+#print(some_data.dtypes)
+data = pd.read_csv("./train.csv", low_memory=False)
+df = data.sample(frac=0.1, random_state=2)
+df_s = data.sample(frac=0.01, random_state=2)
+
+df.to_csv(r'10%_data.csv', index = False)
+df_s.to_csv(r'1%_data.csv', index = False)
+
+def load_df(csv_path='./1%_data.csv', nrows=None):
+    JSON_COLUMNS = ['device', 'geoNetwork', 'totals', 'trafficSource']
+    
+    df = pd.read_csv(csv_path, 
+                     converters={column: json.loads for column in JSON_COLUMNS}, 
+                     dtype={'fullVisitorId': 'str'}, # Important!!
+                     nrows=nrows)
+    
+    for column in JSON_COLUMNS:
+        column_as_df = json_normalize(df[column])
+        column_as_df.columns = [f"{column}.{subcolumn}" for subcolumn in column_as_df.columns]
+        df = df.drop(column, axis=1).merge(column_as_df, right_index=True, left_index=True)
+    print(f"Loaded {os.path.basename(csv_path)}. Shape: {df.shape}")
+    return df
+
+df_train = load_df()
+
+revenue=getcol['totals.transactionRevenue'].fillna(0.0).astype(float)
+df_train['Revenues from transactions']=revenue
+
+
+from datetime import datetime
+df_train['visitStartTime']=pd.to_datetime(df_train['visitStartTime'], unit='s')
+df_train['totals.pageviews']=df_train['totals.pageviews'].fillna(0.0).astype(float)
+browser=df_train['device.browser'].astype('category')
+operSystem=df_train['device.operatingSystem'].astype('category')
+subcont=df_train['geoNetwork.subContinent'].astype('category')
+channel=df_train['channelGrouping'].astype('category')
+engagedOrNot=df_train['socialEngagementType'].astype('category')
+
+# ГРУППИРОВКА И ФУНКЦИИ
+from math import log1p
+def agg(group): # функция, в которой считаются все показатели
+    freeday=0
+    daytime=0
+    revenueForUser=log1p((group['Revenues from transactions']).sum())
+    pageViewsForUser=sum(group['totals.pageviews'])
+    numberOfDevices=group['device.operatingSystem'].nunique()
+    for index, row in group.iterrows(): # пробегаемся по датам в каждой группе 
+        if row['visitStartTime'].strftime('%A')=='Saturday' or row['visitStartTime'].strftime('%A')=='Sunday':
+            freeday=1 #выходной день или нет
+        if 5<=row['visitStartTime'].hour<=21:
+            daytime=1 #дневное или ночное время
+            
+    return freeday, daytime, revenueForUser, pageViewsForUser, numberOfDevices
+def func(group): #функция, в которой все посчитанные показатели собираются в один массив
+    freeday,daytime, revenueForUser,pageViewsForUser,numberOfDevices=agg(group)
+    d = {}
+    d['Weekend or not'] = freeday
+    d['Daytime or not'] = daytime
+    d['Revenue']=revenueForUser
+    d['Page views']=pageViewsForUser
+    d['Number of devices']=numberOfDevices
+    return pd.Series(d, index=['Weekend or not','Daytime or not','Revenue','Page views','Number of devices'])
+groupedData = df_train.groupby("fullVisitorId").apply(func)
+groupedData= groupedData.reset_index()
+groupedData['Browser']=browser.cat.codes
+groupedData['Operating system']=operSystem.cat.codes
+groupedData['Part of the world']=subcont.cat.codes
+groupedData['Channel types']=channel.cat.codes
+groupedData['Socially engaged']=engagedOrNot.cat.codes
+groupedData
+
+#  бустинг
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GridSearchCV
+X=groupedData.drop('Revenue',axis=1) # исключаем из данных зависимую переменную
+y=groupedData['Revenue']
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size = 0.2, random_state=42)
+
+# Loss function to be optimized
+loss = ['ls', 'lad', 'huber']
+
+# Number of trees used in the boosting process
+n_estimators = [100, 500, 900, 1100, 1500]
+
+# Maximum depth of each tree
+max_depth = [2, 3, 5, 10, 15]
+
+# Minimum number of samples per leaf
+min_samples_leaf = [1, 2, 4, 6, 8]
+
+# Minimum number of samples to split a node
+min_samples_split = [2, 4, 6, 10]
+
+# Maximum number of features to consider for making splits
+max_features = ['auto', 'sqrt', 'log2', None]
+
+# Define the grid of hyperparameters to search
+hyperparameter_grid = {'loss': loss,
+    'n_estimators': n_estimators,
+    'max_depth': max_depth,
+    'min_samples_leaf': min_samples_leaf,
+    'min_samples_split': min_samples_split,
+    'max_features': max_features}
+
+gb = GradientBoostingRegressor(random_state=2)
+
+
+# Instantiate grid_rf
+grid_rf = GridSearchCV(estimator=gb,
+                       param_grid=hyperparameter_grid,
+                       scoring='neg_mean_squared_error',
+                       cv=5,
+                       verbose=1,
+                       n_jobs=-1)
+
+grid_rf.fit(X_train, y_train)
+# Extract the best estimator
+best_model = grid_rf.best_estimator_
+
+# Predict test set labels
+y_pred = best_model.predict(X_test)
+
+from sklearn.metrics import mean_squared_error as MSE
+from sklearn.metrics import confusion_matrix, classification_report
+# Compute MSE
+mse_test = MSE(y_test, y_pred)
+# Compute RMSE
+rmse_test = mse_test**(1/2)
+from sklearn.model_selection import cross_val_score
+# Compute 5-fold cross-validation scores: cv_scores
+cv_scores = cross_val_score(best_model, X,y,cv=5)
+# Print the 5-fold cross-validation scores
+print('Test set RMSE of gb: {:.3f}'.format(rmse_test))
+print('5-fold cross-validation scores')
+print(cv_scores)
+print("Average 5-Fold CV Score")
+print(np.mean(cv_scores))
+
+
+# Случайный лес
+# Import RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor
+# Instantiate rf
+rf = RandomForestRegressor(n_estimators=25,
+                           random_state=2)
+# Define the dictionary 'params_rf'
+params_rf = {
+             'n_estimators': [100, 350, 500],
+             'max_features': ['log2', 'auto', 'sqrt'],
+             'min_samples_leaf': [2, 10, 30], 
+             }
+from sklearn.model_selection import  GridSearchCV
+
+# Instantiate grid_rf
+grid_rf = GridSearchCV(estimator=rf,
+                       param_grid=params_rf,
+                       scoring='neg_mean_squared_error',
+                       cv=3,
+                       verbose=1,
+                       n_jobs=-1)
+grid_rf.fit(X_train, y_train)
+# Extract the best estimator
+best_model = grid_rf.best_estimator_
+# Predict test set labels
+y_pred = best_model.predict(X_test)
+
+
+# Evaluate the test set RMSE
+rmse_test = MSE(y_test, y_pred)**(1/2)
+# Print rmse_test
+print('Test set RMSE of rf: {:.2f}'.format(rmse_test))
+# Compute 5-fold cross-validation scores: cv_scores
+cv_scores = cross_val_score(best_model, X,y,cv=5)
+# Print the 5-fold cross-validation scores
+
+print('5-fold cross-validation scores')
+print(cv_scores)
+print("Average 5-Fold CV Score")
+print(np.mean(cv_scores))
+
+
+# SVM
+from sklearn.svm import SVR
+#SVMreg = SVR(kernel='rbf')
+parameters = {'kernel': ('linear', 'rbf','poly'), 'C':[1.5, 10],'gamma': [1e-7, 1e-4],'epsilon':[0.1,0.2,0.5,0.3]}
+from sklearn.metrics import make_scorer
+scorer = make_scorer(mean_squared_error, greater_is_better=False)
+svr_gs = GridSearchCV(SVR(epsilon = 0.01), parameters, cv = 5, scoring=scorer)
+svr_gs.fit(X,y)
+# Extract the best estimator
+best_model = GridSearchCV.best_estimator_
+# Predict test set labels
+y_pred = best_model.predict(X_test)
+#SVMreg.fit()
+print('SVM Score:')
+print(SVMreg.score(X_train, y_train))
+print(SVMreg.score(X_test, y_test))
+# Compute 5-fold cross-validation scores: cv_scores
+cv_scores = cross_val_score(best_model, X,y,cv=5)
+# Print the 5-fold cross-validation scores
+print('5-fold cross-validation scores')
+print(cv_scores)
+print("Average 5-Fold CV Score")
+print(np.mean(cv_scores))
+
+# линейная регрессия
+# Import LinearRegression
+from sklearn.metrics import mean_squared_error
+from sklearn.linear_model import LinearRegression
+
+# Create the regressor: reg
+reg = LinearRegression()
+reg.fit(X_train,y_train)
+# Predict on the test data: y_pred
+y_pred = reg.predict(X_test)
+
+# Compute and print R^2 and RMSE
+print("R^2: {}".format(reg.score(X_test, y_test)))
+rmse = np.sqrt(mean_squared_error(y_test,y_pred))
+print("Root Mean Squared Error: {}".format(rmse))
+# Compute 5-fold cross-validation scores: cv_scores
+cv_scores = cross_val_score(SVMreg, X,y,cv=5)
+# Print the 5-fold cross-validation scores
+print('5-fold cross-validation scores')
+print(cv_scores)
+print("Average 5-Fold CV Score")
+print(np.mean(cv_scores))
